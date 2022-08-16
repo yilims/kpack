@@ -56,6 +56,14 @@ const (
 	component             = "controller"
 )
 
+type DeployMode uint32
+
+const (
+	Cluster DeployMode = iota
+	Namespace
+	Normal
+)
+
 func getEnvBool(key string, defaultValue bool) bool {
 	s := os.Getenv(key)
 	v, err := strconv.ParseBool(s)
@@ -68,6 +76,8 @@ func getEnvBool(key string, defaultValue bool) bool {
 var (
 	kubeconfig = flag.String("kubeconfig", "", "Path to a kubeconfig. Only required if out-of-cluster.")
 	masterURL  = flag.String("master", "", "The address of the Kubernetes API server. Overrides any value in kubeconfig. Only required if out-of-cluster.")
+	mode       = flag.String("mode", os.Getenv("MODE"), "The deployment mode. Cluster mode only reconcile the cluster resource, namespace mode only reconcile the resource in the namespace")
+	namespace  = flag.String("namespace", os.Getenv("SYSTEM_NAMESPACE"), "Namespace to watch")
 
 	buildInitImage         = flag.String("build-init-image", os.Getenv("BUILD_INIT_IMAGE"), "The image used to initialize a build")
 	buildInitWindowsImage  = flag.String("build-init-windows-image", os.Getenv("BUILD_INIT_WINDOWS_IMAGE"), "The image used to initialize a build on windows")
@@ -108,7 +118,9 @@ func main() {
 		BuilderPollingFrequency: 1 * time.Minute,
 	}
 
-	informerFactory := externalversions.NewSharedInformerFactory(client, options.ResyncPeriod)
+	log.Printf("Watch resources in namespace: %v\n", *namespace)
+
+	informerFactory := externalversions.NewSharedInformerFactoryWithOptions(client, options.ResyncPeriod, externalversions.WithNamespace(*namespace))
 	buildInformer := informerFactory.Kpack().V1alpha2().Builds()
 	imageInformer := informerFactory.Kpack().V1alpha2().Images()
 	sourceResolverInformer := informerFactory.Kpack().V1alpha2().SourceResolvers()
@@ -122,7 +134,7 @@ func main() {
 		ClusterBuilderInformer: clusterBuilderInformer,
 	}
 
-	k8sInformerFactory := informers.NewSharedInformerFactory(k8sClient, options.ResyncPeriod)
+	k8sInformerFactory := informers.NewSharedInformerFactoryWithOptions(k8sClient, options.ResyncPeriod, informers.WithNamespace(*namespace))
 	pvcInformer := k8sInformerFactory.Core().V1().PersistentVolumeClaims()
 	podInformer := k8sInformerFactory.Core().V1().Pods()
 	keychainFactory, err := k8sdockercreds.NewSecretKeychainFactory(k8sClient)
@@ -184,37 +196,46 @@ func main() {
 	imageController := image.NewController(options, k8sClient, imageInformer, buildInformer, duckBuilderInformer, sourceResolverInformer, pvcInformer, *enablePriorityClasses)
 	sourceResolverController := sourceresolver.NewController(options, sourceResolverInformer, gitResolver, blobResolver, registryResolver)
 	builderController, builderResync := builder.NewController(options, builderInformer, builderCreator, keychainFactory, clusterStoreInformer, clusterStackInformer)
-	clusterBuilderController, clusterBuilderResync := clusterBuilder.NewController(options, clusterBuilderInformer, builderCreator, keychainFactory, clusterStoreInformer, clusterStackInformer)
-	clusterStoreController := clusterstore.NewController(options, keychainFactory, clusterStoreInformer, remoteStoreReader)
-	clusterStackController := clusterstack.NewController(options, keychainFactory, clusterStackInformer, remoteStackReader)
-
 	lifecycleProvider.AddEventHandler(builderResync)
-	lifecycleProvider.AddEventHandler(clusterBuilderResync)
+
+	var (
+		clusterStoreController   *controller.Impl
+		clusterStackController   *controller.Impl
+		clusterBuilderController *controller.Impl
+		clusterBuilderResync     func()
+	)
+	if !(*mode == "namespace") {
+		clusterBuilderController, clusterBuilderResync = clusterBuilder.NewController(options, clusterBuilderInformer, builderCreator, keychainFactory, clusterStoreInformer, clusterStackInformer)
+		clusterStoreController = clusterstore.NewController(options, keychainFactory, clusterStoreInformer, remoteStoreReader)
+		clusterStackController = clusterstack.NewController(options, keychainFactory, clusterStackInformer, remoteStackReader)
+		lifecycleProvider.AddEventHandler(clusterBuilderResync)
+	}
 
 	stopChan := make(chan struct{})
 	informerFactory.Start(stopChan)
 	k8sInformerFactory.Start(stopChan)
 
-	waitForSync(stopChan,
+	informs := []cache.SharedIndexInformer{
 		buildInformer.Informer(),
 		imageInformer.Informer(),
 		sourceResolverInformer.Informer(),
 		pvcInformer.Informer(),
 		podInformer.Informer(),
 		builderInformer.Informer(),
-		clusterBuilderInformer.Informer(),
-		clusterStoreInformer.Informer(),
-		clusterStackInformer.Informer(),
-	)
+	}
 
-	err = runGroup(
-		ctx,
-		run(clusterStackController, routinesPerController),
+	if !(*mode == "namespace") {
+		informs = append(informs, clusterBuilderInformer.Informer(),
+			clusterStoreInformer.Informer(),
+			clusterStackInformer.Informer())
+	}
+
+	waitForSync(stopChan, informs...)
+
+	doneFuns := []doneFunc{
 		run(imageController, routinesPerController),
 		run(buildController, routinesPerController),
 		run(builderController, routinesPerController),
-		run(clusterBuilderController, routinesPerController),
-		run(clusterStoreController, routinesPerController),
 		run(sourceResolverController, 2*routinesPerController),
 		configMapWatcher.Start,
 		func(done <-chan struct{}) error {
@@ -224,7 +245,14 @@ func main() {
 			<-done
 			return profilingServer.Shutdown(ctx)
 		},
-	)
+	}
+	if !(*mode == "namespace") {
+		doneFuns = append(doneFuns,
+			run(clusterStackController, routinesPerController),
+			run(clusterBuilderController, routinesPerController),
+			run(clusterStoreController, routinesPerController))
+	}
+	err = runGroup(ctx, doneFuns...)
 	if err != nil && err != http.ErrServerClosed {
 		logger.Fatalw("Error running controller", zap.Error(err))
 	}
